@@ -316,6 +316,47 @@ class OpenCodeQueryResult(QueryResult):
     session_id: Optional[str] = None
 
 
+_RATE_LIMIT_SIGNS = (
+    "resource exhausted",            # vertex, project-level
+    "rate limit",
+    "rate-limited",
+    "ratelimit",
+    "too many requests",
+    "429",
+    "resource_exhausted",
+    "quota exceeded",
+)
+
+
+def _is_rate_limit(name: str, message: str) -> bool:
+    """Whether a provider error is back-pressure rather than a bad request.
+
+    Read alongside the `statusCode` test at the call site: a provider that
+    sends a status gets classified by it, and this catches the ones that
+    only say so in words.
+    """
+    blob = f"{name} {message}".lower()
+    return any(s in blob for s in _RATE_LIMIT_SIGNS)
+
+
+def _rate_limit_waits() -> List[int]:
+    """Seconds to wait between 429 retries, longest repeated at the end.
+
+    Vertex answers a project-level rate limit for minutes at a time, so the
+    ladder ends on a plateau rather than growing without bound.  Set
+    CHIA_RATE_LIMIT_RETRIES to change how many waits are allowed (0 disables).
+    """
+    ladder = [30, 60, 120, 240, 300, 300]
+    try:
+        n = int(os.environ.get("CHIA_RATE_LIMIT_RETRIES", len(ladder)))
+    except ValueError:
+        n = len(ladder)
+    n = max(0, n)
+    if n <= len(ladder):
+        return ladder[:n]
+    return ladder + [ladder[-1]] * (n - len(ladder))
+
+
 class OpenCodeLLM(LLMCallBase):
     """Wraps the ``opencode`` CLI as an LLM backend.
 
@@ -412,7 +453,16 @@ class OpenCodeLLM(LLMCallBase):
 
         profiler = get_profiler()
 
-        for attempt in range(self.retries):
+        # A 429 is the provider's back-pressure, not a bad call.  Upstream
+        # propagates it immediately, which burns one of this call's attempts
+        # (ADIR counts and bills those) and, on Vertex, throws the whole run
+        # away during a rate-limit window.  Wait it out on a budget of its own
+        # instead; CHIA_RATE_LIMIT_RETRIES=0 restores the upstream behaviour.
+        rl_waits = _rate_limit_waits()
+        rl_used = 0
+
+        attempt = 0
+        while attempt < self.retries:
             try:
                 self._last_metadata = {}
                 self._last_export_error = None
@@ -434,8 +484,33 @@ class OpenCodeLLM(LLMCallBase):
                 cli.success = True
                 return cli
 
+            # -- Rate limit: wait it out without spending an attempt --
+            except RateLimitError as exc:
+                if rl_used >= len(rl_waits):
+                    raise
+                wait = rl_waits[rl_used]
+                # The provider's own reset time wins when it asks for longer than the ladder;
+                # RateLimitError carries it as a datetime, parsed from Retry-After where the
+                # provider sends one and an hour-ahead default where it does not, so it is
+                # capped rather than trusted outright.
+                reset = getattr(exc, "reset_time", None)
+                if reset is not None:
+                    try:
+                        hinted = (reset - datetime.now(timezone.utc)).total_seconds()
+                        wait = max(wait, min(int(hinted), 900))
+                    except (TypeError, ValueError, AttributeError):
+                        pass
+                rl_used += 1
+                self.logger.warning(
+                    "Rate limited (429); waiting %ds, then retrying (%d/%d waits used, "
+                    "attempt %d/%d unspent)",
+                    wait, rl_used, len(rl_waits), attempt + 1, self.retries,
+                )
+                _time.sleep(wait)
+                continue
+
             # -- Never retry: propagate immediately --
-            except (RateLimitError, AuthenticationError, BillingError, InvalidRequestError):
+            except (AuthenticationError, BillingError, InvalidRequestError):
                 raise
 
             # -- Retry once: stochastic generation may produce shorter output --
@@ -445,6 +520,7 @@ class OpenCodeLLM(LLMCallBase):
                         "Max output tokens on attempt %d/%d, retrying once",
                         attempt + 1, self.retries,
                     )
+                    attempt += 1
                     continue
                 raise
 
@@ -473,6 +549,8 @@ class OpenCodeLLM(LLMCallBase):
                     "Unexpected error on attempt %d/%d: %s",
                     attempt + 1, self.retries, exc,
                 )
+
+            attempt += 1
         return OpenCodeQueryResult(result="", returncode=-1, stderr="", stream_result="", success=False)
 
     def _get_node_id(self) -> str:
@@ -515,7 +593,16 @@ class OpenCodeLLM(LLMCallBase):
             status = data.get("statusCode")
 
             # Rate limit — honor the provider's Retry-After when present.
-            if status == 429:
+            #
+            # `statusCode` alone misses most of them. Vertex answers a project-level limit with
+            # `AI_APICallError: Resource exhausted. Please try again later.` and OpenRouter with
+            # `is temporarily rate-limited upstream`, and neither reaches here with a status: when
+            # the run fails before an assistant message exists the export holds no error at all and
+            # the run stream's event carries a message and no code. Over one five-model comparison
+            # the log held 23 such rate limits while this branch fired zero times, so every one of
+            # them took the generic failure path -- a wasted attempt instead of a wait. Matching the
+            # message as well is what makes the backoff above reachable.
+            if status == 429 or _is_rate_limit(name, message):
                 headers = data.get("responseHeaders", {}) or {}
                 retry_after = headers.get("retry-after") or headers.get("Retry-After")
                 reset_time = datetime.now(timezone.utc) + timedelta(seconds=60)
