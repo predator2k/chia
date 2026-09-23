@@ -706,8 +706,16 @@ class OpenCodeLLM(LLMCallBase):
                 provider_cfg[provider.id] = provider.to_config_entry()
         return cfg
 
+    # Linux caps one argv string at MAX_ARG_STRLEN (128 KiB); a longer message fails with E2BIG
+    # ("Argument list too long") before opencode starts. Above this size the message goes on stdin,
+    # which ``opencode run`` reads when it is not a terminal.
+    STDIN_MESSAGE_BYTES = 64 * 1024
+
+    def _message_on_stdin(self, user_message: str) -> bool:
+        return len(user_message.encode("utf-8")) > self.STDIN_MESSAGE_BYTES
+
     def _build_run_cmd(self, user_message: str) -> list:
-        """Build the ``opencode run`` command list (message is a positional arg)."""
+        """Build the ``opencode run`` command list (message is a positional arg, or on stdin when long)."""
         cmd = [
             self.opencode_bin,
             "run",
@@ -722,7 +730,8 @@ class OpenCodeLLM(LLMCallBase):
             cmd += ["--dir", self.work_dir]
         if self.extra_cli_args:
             cmd += self.extra_cli_args
-        cmd.append(user_message)
+        if not self._message_on_stdin(user_message):
+            cmd.append(user_message)
         return cmd
 
     def _run_opencode(
@@ -756,7 +765,8 @@ class OpenCodeLLM(LLMCallBase):
             # Capture via a file, not a pipe: a large run stream would otherwise
             # be truncated at 64 KiB (see _capture / module docstring), which can
             # drop the trailing error events parse_run_error looks for.
-            run = self._capture(run_cmd, env)
+            run = self._capture(run_cmd, env,
+                                stdin_text=user_message if self._message_on_stdin(user_message) else None)
         finally:
             try:
                 os.unlink(cfg_path)
@@ -823,7 +833,7 @@ class OpenCodeLLM(LLMCallBase):
             session_id=session_id,
         )
 
-    def _capture(self, cmd: list, env: dict) -> SimpleNamespace:
+    def _capture(self, cmd: list, env: dict, stdin_text: Optional[str] = None) -> SimpleNamespace:
         """Run *cmd* capturing stdout to a temp FILE and return it.
 
         Returns a ``SimpleNamespace(returncode, stdout, stderr)`` (the same shape
@@ -841,11 +851,17 @@ class OpenCodeLLM(LLMCallBase):
         )
         out_path = tmp.name
         tmp.close()
+        in_path = None
+        if stdin_text is not None:
+            # a file, not a pipe: the whole message is there at once and EOF follows it
+            fd, in_path = tempfile.mkstemp(suffix=".txt", prefix="opencode_in_")
+            with os.fdopen(fd, "w") as fh:
+                fh.write(stdin_text)
         try:
-            with open(out_path, "w") as out_fh:
+            with open(out_path, "w") as out_fh, open(in_path or os.devnull, "r") as in_fh0:
                 proc = subprocess.run(
                     cmd,
-                    stdin=subprocess.DEVNULL,
+                    stdin=in_fh0,
                     stdout=out_fh,
                     stderr=subprocess.PIPE,
                     text=True,
@@ -858,10 +874,12 @@ class OpenCodeLLM(LLMCallBase):
                 returncode=proc.returncode, stdout=stdout, stderr=proc.stderr or ""
             )
         finally:
-            try:
-                os.unlink(out_path)
-            except OSError:
-                pass
+            for p in (out_path, in_path):
+                if p:
+                    try:
+                        os.unlink(p)
+                    except OSError:
+                        pass
 
     def _run_export(self, session_id: str, env: dict) -> dict:
         """``opencode export <id>`` → parsed session JSON (``{}`` on failure)."""
