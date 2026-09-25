@@ -412,13 +412,18 @@ def _is_billing(message: str) -> bool:
     return any(s in blob for s in _BILLING_SIGNS)
 
 
+_STDERR_402_RE = re.compile(r"(?:\bstatus(?:_?code)?|\bhttp(?:/[0-9.]+)?|\bcode|\berror|apierror)[^0-9a-z]{0,16}402\b|\b402\s+payment")
+
+
 def _stderr_is_billing(stderr: str) -> bool:
     """A billing refusal in the CLI's plain-text stderr (no structured error):
     one of the phrases, or a 402 status next to the words 'status'/'http'/'code'."""
     blob = (stderr or "").lower()
     if _is_billing(blob):
         return True
-    return any(w in blob for w in ("status", "http", "code")) and bool(_HTTP_402_RE.search(blob))
+    # 402 must sit next to a status word ("status 402", "HTTP/1.1 402", "code: 402", "402 Payment"): a stack
+    # frame (index.js:402:17) or "402 tokens" beside the word "opencode" is not a billing refusal
+    return bool(_STDERR_402_RE.search(blob))
 
 
 def _rate_limit_waits() -> List[int]:

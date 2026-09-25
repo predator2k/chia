@@ -221,3 +221,12 @@ def test_timed_out_attempt_keeps_its_session_and_usage(monkeypatch):
     assert res.usage["cost_usd"] == pytest.approx(0.04)
     assert "TimeoutExpired" in res.stderr and "timed out after 5" in res.stderr
     assert res.attempts[0]["session_id"] == "ses_t1"
+
+
+def test_stderr_402_needs_a_status_word():
+    from chia.models.opencode import _stderr_is_billing as f
+    assert not f("at opencode (index.js:402:17)")
+    assert not f("opencode used 402 tokens")
+    for s in ("Error: status 402 Insufficient Balance", "HTTP/1.1 402 Payment Required", "statusCode: 402",
+              "status_code=402", "APIError code: 402"):
+        assert f(s), s
