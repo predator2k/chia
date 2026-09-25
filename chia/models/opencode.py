@@ -63,6 +63,13 @@ class OpenCodeError(Exception):
             (self.node_id, self.error_type, self.exit_code, self.raw_message),
         )
 
+    def __reduce_ex__(self, protocol):
+        # Every subclass's __reduce__ gives the constructor args; the per-call record that
+        # OpenCodeLLM.prompt attaches (attempts, usage) rides along as state across Ray.
+        r = self.__reduce__()
+        extra = {k: self.__dict__[k] for k in ("attempts", "usage") if k in self.__dict__}
+        return (r[0], r[1], extra) if extra else r
+
 
 class RateLimitError(OpenCodeError):
     """The provider behind opencode reported a usage/rate limit."""
@@ -314,6 +321,50 @@ class OpenCodeQueryResult(QueryResult):
 
     usage: Optional[dict] = None
     session_id: Optional[str] = None
+    # One entry per attempt of this call (see OpenCodeLLM.prompt); ``usage`` is their sum.
+    attempts: Optional[list] = None
+    # The structured error event ({name, data}) of a failed call's last attempt.
+    error: Optional[dict] = None
+
+
+_USAGE_KEYS = ("input_tokens", "output_tokens", "reasoning_tokens", "cache_read", "cache_write",
+               "cost_usd", "num_turns")
+
+
+def _sum_usage(attempts: List[dict]) -> dict:
+    """The attempts' usage dicts summed key by key (numbers only)."""
+    total: dict = {}
+    for a in attempts:
+        for k, v in (a.get("usage") or {}).items():
+            if isinstance(v, (int, float)) and not isinstance(v, bool):
+                total[k] = total.get(k, 0) + v
+    return total
+
+
+def _public_attempts(attempts: List[dict]) -> List[dict]:
+    """The attempt records without their transcripts (a failed result carries the last one)."""
+    return [{k: v for k, v in a.items() if k != "stream"} for a in attempts]
+
+
+def _failure_text(attempts: List[dict]) -> str:
+    """Why a call failed: the last attempt's error type and message, its structured error event and
+    its CLI stderr, after a one-line summary of the earlier attempts."""
+    if not attempts:
+        return "no attempt was made"
+    lines = []
+    for a in attempts[:-1]:
+        lines.append(f"attempt {a['attempt']}: {a.get('error_type', 'ok')}: "
+                     f"{str(a.get('error', ''))[:300]}")
+    a = attempts[-1]
+    lines.append(f"attempt {a['attempt']} of {len(attempts)} (last): {a.get('error_type', 'unknown')}: "
+                 f"{a.get('error', '')}")
+    if a.get("error_event"):
+        lines.append("error event: " + json.dumps(a["error_event"], default=str)[:4000])
+    if a.get("session_id"):
+        lines.append(f"session: {a['session_id']}")
+    if a.get("stderr"):
+        lines.append("stderr: " + a["stderr"][-4000:])
+    return "\n".join(lines)
 
 
 _RATE_LIMIT_SIGNS = (
@@ -339,6 +390,37 @@ def _is_rate_limit(name: str, message: str) -> bool:
     return any(s in blob for s in _RATE_LIMIT_SIGNS)
 
 
+_BILLING_SIGNS = (
+    "insufficient balance",          # DeepSeek: HTTP 402 {"error":{"message":"Insufficient Balance"}}
+    "insufficient_balance",
+    "insufficient credit",
+    "available credits",             # openrouter: "exceed your available credits"
+    "credit balance is too low",     # anthropic
+    "payment required",              # the 402 reason phrase
+)
+_HTTP_402_RE = re.compile(r"(?<![\d.])402(?![\d.])")
+
+
+def _is_billing(message: str) -> bool:
+    """Whether an error text names an out-of-credit / payment refusal.
+
+    Only explicit phrases (and the 402 status as a whole number) count: a
+    billing refusal must stop a run instead of being retried or counted as a
+    bad request, and a false positive would stop a run that could go on.
+    """
+    blob = (message or "").lower()
+    return any(s in blob for s in _BILLING_SIGNS)
+
+
+def _stderr_is_billing(stderr: str) -> bool:
+    """A billing refusal in the CLI's plain-text stderr (no structured error):
+    one of the phrases, or a 402 status next to the words 'status'/'http'/'code'."""
+    blob = (stderr or "").lower()
+    if _is_billing(blob):
+        return True
+    return any(w in blob for w in ("status", "http", "code")) and bool(_HTTP_402_RE.search(blob))
+
+
 def _rate_limit_waits() -> List[int]:
     """Seconds to wait between 429 retries, longest repeated at the end.
 
@@ -355,6 +437,61 @@ def _rate_limit_waits() -> List[int]:
     if n <= len(ladder):
         return ladder[:n]
     return ladder + [ladder[-1]] * (n - len(ladder))
+
+
+def opencode_tool_output_dir(env: Optional[dict] = None) -> str:
+    """opencode's shared tool-output directory (``<data>/opencode/tool-output``).
+
+    opencode writes a tool output that exceeds its truncation limit there, for every session of the
+    user, and computes the directory as ``$XDG_DATA_HOME/opencode/tool-output`` (``~/.local/share``
+    when XDG_DATA_HOME is unset, ``~`` being ``$HOME``) -- this mirrors that computation.
+    """
+    env = os.environ if env is None else env
+    data = env.get("XDG_DATA_HOME") or os.path.join(
+        env.get("HOME") or os.path.expanduser("~"), ".local", "share")
+    return os.path.normpath(os.path.join(data, "opencode", "tool-output"))
+
+
+def _deny_last(block, pattern: str):
+    """A permission value (``"allow"``, ``{pattern: action}`` or absent) with ``pattern: deny`` as its
+    last rule (opencode takes the last matching rule). An absent value gains only that rule, so
+    opencode's defaults for the other paths stand."""
+    if isinstance(block, dict):
+        out = {k: v for k, v in block.items() if k != pattern}
+    elif isinstance(block, str):
+        out = {"*": block}
+    else:
+        out = {}
+    out[pattern] = "deny"
+    return out
+
+
+def deny_tool_output(permission: dict, env: Optional[dict] = None) -> dict:
+    """*permission* with opencode's shared tool-output directory denied.
+
+    opencode appends ``external_directory: {<data>/opencode/tool-output/*: allow}`` after the configured
+    rules (last rule wins) -- unless the agent's rules already carry an ``external_directory`` *deny* for
+    exactly that glob. So the glob, spelled as opencode spells it, is denied here as the last
+    external_directory rule, which both suppresses the append and wins over opencode's own default allow.
+    The read tool also asks ``read`` with the path relative to the worktree, so a ``read`` deny on the
+    directory backs that up (glob and grep ask with their search pattern, not the path: only the
+    external_directory rule covers them).
+    """
+    perm = dict(permission or {})
+    d = opencode_tool_output_dir(env)
+    globs = [os.path.join(d, "*")]
+    real = os.path.join(os.path.realpath(d), "*")
+    if real not in globs:
+        globs.append(real)
+    ext = perm.get("external_directory")
+    for g in globs:
+        ext = _deny_last(ext, g)
+    perm["external_directory"] = ext
+    read = perm.get("read")
+    for pat in ("*opencode/tool-output", "*opencode/tool-output/*"):
+        read = _deny_last(read, pat)
+    perm["read"] = read
+    return perm
 
 
 class OpenCodeLLM(LLMCallBase):
@@ -429,7 +566,10 @@ class OpenCodeLLM(LLMCallBase):
     # Public API
     # ------------------------------------------------------------------
 
-    @ChiaFunction(resources={"opencode_creds": 0.01})
+    # max_retries=0: Ray must never re-run a whole agent call on its own (a worker that dies mid-call
+    # would otherwise start the session again, unseen and uncounted); the call fails instead. The
+    # retries below are this method's own, and each one is recorded in the result's ``attempts``.
+    @ChiaFunction(resources={"opencode_creds": 0.01}, max_retries=0, retry_exceptions=False)
     def prompt(
         self,
         user_message: str,
@@ -437,9 +577,17 @@ class OpenCodeLLM(LLMCallBase):
     ) -> QueryResult:
         """Send *user_message* to opencode and return the response.
 
+        Every attempt (a rate-limit wait's retry included) is recorded: the result's ``attempts`` holds
+        one ``{attempt, session_id, usage, error_type, error, error_event, returncode, stderr}`` per
+        attempt, and its ``usage`` is the sum over all of them, so the tokens and cost of a failed or
+        retried attempt are never lost. A typed error that propagates carries the same ``attempts`` and
+        ``usage`` attributes.
+
         Returns:
             :class:`QueryResult` with ``success=True`` when opencode ran cleanly,
-            or ``success=False`` when every retry attempt failed.
+            or ``success=False`` when every retry attempt failed; then ``stderr``
+            names the last attempt's failure (its error type and message, the
+            structured error event and the CLI's stderr).
 
         Raises:
             RateLimitError / AuthenticationError / BillingError /
@@ -460,9 +608,16 @@ class OpenCodeLLM(LLMCallBase):
         # instead; CHIA_RATE_LIMIT_RETRIES=0 restores the upstream behaviour.
         rl_waits = _rate_limit_waits()
         rl_used = 0
+        attempts: List[dict] = []
+
+        def _raise(exc: Exception):
+            exc.attempts = _public_attempts(attempts)
+            exc.usage = _sum_usage(attempts)
+            raise exc
 
         attempt = 0
         while attempt < self.retries:
+            cli = None
             try:
                 self._last_metadata = {}
                 self._last_export_error = None
@@ -481,77 +636,119 @@ class OpenCodeLLM(LLMCallBase):
                     cli, export_error=getattr(self, "_last_export_error", None),
                 )
 
+                attempts.append(self._attempt_record(len(attempts) + 1, cli, None))
                 cli.success = True
+                cli.usage = _sum_usage(attempts) or cli.usage
+                cli.attempts = _public_attempts(attempts)
                 return cli
 
-            # -- Rate limit: wait it out without spending an attempt --
-            except RateLimitError as exc:
-                if rl_used >= len(rl_waits):
-                    raise
-                wait = rl_waits[rl_used]
-                # The provider's own reset time wins when it asks for longer than the ladder;
-                # RateLimitError carries it as a datetime, parsed from Retry-After where the
-                # provider sends one and an hour-ahead default where it does not, so it is
-                # capped rather than trusted outright.
-                reset = getattr(exc, "reset_time", None)
-                if reset is not None:
-                    try:
-                        hinted = (reset - datetime.now(timezone.utc)).total_seconds()
-                        wait = max(wait, min(int(hinted), 900))
-                    except (TypeError, ValueError, AttributeError):
-                        pass
-                rl_used += 1
-                self.logger.warning(
-                    "Rate limited (429); waiting %ds, then retrying (%d/%d waits used, "
-                    "attempt %d/%d unspent)",
-                    wait, rl_used, len(rl_waits), attempt + 1, self.retries,
-                )
-                _time.sleep(wait)
-                continue
+            except Exception as exc:  # noqa: BLE001 -- recorded, then dispatched by type below
+                if cli is None:
+                    cli = getattr(exc, "partial", None)   # a timed-out run's session, if it had one
+                attempts.append(self._attempt_record(len(attempts) + 1, cli, exc))
 
-            # -- Never retry: propagate immediately --
-            except (AuthenticationError, BillingError, InvalidRequestError):
-                raise
-
-            # -- Retry once: stochastic generation may produce shorter output --
-            except MaxOutputTokensError:
-                if attempt == 0:
+                # -- Rate limit: wait it out without spending an attempt --
+                if isinstance(exc, RateLimitError):
+                    if rl_used >= len(rl_waits):
+                        _raise(exc)
+                    wait = rl_waits[rl_used]
+                    # The provider's own reset time wins when it asks for longer than the ladder;
+                    # RateLimitError carries it as a datetime, parsed from Retry-After where the
+                    # provider sends one and an hour-ahead default where it does not, so it is
+                    # capped rather than trusted outright.
+                    reset = getattr(exc, "reset_time", None)
+                    if reset is not None:
+                        try:
+                            hinted = (reset - datetime.now(timezone.utc)).total_seconds()
+                            wait = max(wait, min(int(hinted), 900))
+                        except (TypeError, ValueError, AttributeError):
+                            pass
+                    rl_used += 1
                     self.logger.warning(
-                        "Max output tokens on attempt %d/%d, retrying once",
-                        attempt + 1, self.retries,
+                        "Rate limited (429); waiting %ds, then retrying (%d/%d waits used, "
+                        "attempt %d/%d unspent)",
+                        wait, rl_used, len(rl_waits), attempt + 1, self.retries,
                     )
-                    attempt += 1
+                    _time.sleep(wait)
                     continue
-                raise
 
-            # -- Retry with exponential backoff: transient service issue --
-            except ServerError:
-                backoff = min(5 * 2 ** attempt, 60)
-                self.logger.warning(
-                    "Server error on attempt %d/%d, backing off %ds",
-                    attempt + 1, self.retries, backoff,
-                )
-                _time.sleep(backoff)
+                # -- Never retry: propagate immediately --
+                if isinstance(exc, (AuthenticationError, BillingError, InvalidRequestError)):
+                    _raise(exc)
 
-            except UnknownOpenCodeError as exc:
-                self.logger.warning(
-                    "Unknown error on attempt %d/%d: %s",
-                    attempt + 1, self.retries, exc,
-                )
+                # -- Retry once: stochastic generation may produce shorter output --
+                if isinstance(exc, MaxOutputTokensError):
+                    if attempt == 0:
+                        self.logger.warning(
+                            "Max output tokens on attempt %d/%d, retrying once",
+                            attempt + 1, self.retries,
+                        )
+                        attempt += 1
+                        continue
+                    _raise(exc)
 
-            except subprocess.TimeoutExpired:
-                self.logger.warning(
-                    "Timeout on attempt %d/%d", attempt + 1, self.retries,
-                )
-
-            except Exception as exc:
-                self.logger.warning(
-                    "Unexpected error on attempt %d/%d: %s",
-                    attempt + 1, self.retries, exc,
-                )
+                # -- Retry with exponential backoff: transient service issue --
+                if isinstance(exc, ServerError):
+                    backoff = min(5 * 2 ** attempt, 60)
+                    self.logger.warning(
+                        "Server error on attempt %d/%d, backing off %ds",
+                        attempt + 1, self.retries, backoff,
+                    )
+                    if attempt + 1 < self.retries:
+                        _time.sleep(backoff)
+                elif isinstance(exc, UnknownOpenCodeError):
+                    self.logger.warning(
+                        "Unknown error on attempt %d/%d: %s",
+                        attempt + 1, self.retries, exc,
+                    )
+                elif isinstance(exc, subprocess.TimeoutExpired):
+                    self.logger.warning(
+                        "Timeout on attempt %d/%d", attempt + 1, self.retries,
+                    )
+                else:
+                    self.logger.warning(
+                        "Unexpected error on attempt %d/%d: %s",
+                        attempt + 1, self.retries, exc,
+                    )
 
             attempt += 1
-        return OpenCodeQueryResult(result="", returncode=-1, stderr="", stream_result="", success=False)
+
+        last = attempts[-1] if attempts else {}
+        return OpenCodeQueryResult(
+            result="",
+            returncode=last.get("returncode") if last.get("returncode") not in (None, 0) else -1,
+            stderr=_failure_text(attempts),
+            stream_result=last.get("stream", "") or "",
+            success=False,
+            usage=_sum_usage(attempts) or None,
+            session_id=last.get("session_id"),
+            attempts=_public_attempts(attempts),
+            error=last.get("error_event"),
+        )
+
+    @staticmethod
+    def _attempt_record(n: int, cli, exc: Optional[BaseException]) -> dict:
+        """One attempt as the result's ``attempts`` lists it (``stream`` is dropped from the list
+        entries the caller sees except the last one's, which becomes a failed result's transcript)."""
+        rec: dict = {"attempt": n, "session_id": getattr(cli, "session_id", None),
+                     "usage": dict(getattr(cli, "usage", None) or {})}
+        if cli is not None:
+            rec["returncode"] = getattr(cli, "returncode", None)
+            rec["stream"] = getattr(cli, "stream_result", "") or ""
+            err = (getattr(cli, "stderr", "") or "").strip()
+            if err:
+                rec["stderr"] = err[-4000:]
+            if getattr(cli, "error", None):
+                rec["error_event"] = cli.error
+        if exc is not None:
+            rec["error_type"] = type(exc).__name__
+            if isinstance(exc, subprocess.TimeoutExpired):
+                rec["error"] = f"timed out after {exc.timeout} s"
+            else:
+                rec["error"] = (getattr(exc, "raw_message", "") or str(exc))[:4000]
+            if isinstance(exc, UnknownOpenCodeError) and exc.stderr and not rec.get("stderr"):
+                rec["stderr"] = exc.stderr.strip()[-4000:]
+        return rec
 
     def _get_node_id(self) -> str:
         try:
@@ -591,6 +788,11 @@ class OpenCodeLLM(LLMCallBase):
             data = export_error.get("data", {}) or {}
             message = data.get("message", "") or ""
             status = data.get("statusCode")
+
+            # Billing — out of credit (DeepSeek answers HTTP 402 "Insufficient Balance"). Checked
+            # first: it must stop the caller, never be waited on, retried or taken for a bad request.
+            if status == 402 or _is_billing(message):
+                raise BillingError(node_id, cli.returncode, message or str(export_error))
 
             # Rate limit — honor the provider's Retry-After when present.
             #
@@ -655,6 +857,9 @@ class OpenCodeLLM(LLMCallBase):
         # stderr) or an empty response. opencode surfaces its real errors as
         # structured JSON (handled above), so there's nothing reliable to
         # classify here — report it honestly as unknown with the stderr attached.
+        # The one exception is an explicit billing refusal: it must stop the caller.
+        if _stderr_is_billing(cli.stderr):
+            raise BillingError(node_id, cli.returncode, cli.stderr[-2000:])
         raise UnknownOpenCodeError(
             node_id, cli.returncode, cli.stderr[:300] or "empty response",
             stderr=cli.stderr,
@@ -694,12 +899,15 @@ class OpenCodeLLM(LLMCallBase):
         # external_directory, whose "ask" default blocks a non-interactive run
         # (the --dangerously-skip-permissions flag does NOT cover it).
         # Override via the `permission` kwarg.
-        cfg["permission"] = self.config if self.config is not None else {
+        perm = self.config if self.config is not None else {
             "edit": "allow",
             "bash": "allow",
             "webfetch": "allow",
             "external_directory": "allow",
         }
+        # opencode's tool-output directory is shared by every session of the user (other runs' truncated
+        # tool outputs land there), so no call may read it, whatever the caller's block says.
+        cfg["permission"] = deny_tool_output(perm)
         if self.additional_providers:
             provider_cfg: dict = cfg.setdefault("provider", {})
             for provider in self.additional_providers:
@@ -767,6 +975,11 @@ class OpenCodeLLM(LLMCallBase):
             # drop the trailing error events parse_run_error looks for.
             run = self._capture(run_cmd, env,
                                 stdin_text=user_message if self._message_on_stdin(user_message) else None)
+        except subprocess.TimeoutExpired as exc:
+            # The killed run still created a session and spent tokens: read them back from the
+            # export so the attempt's session id and usage are recorded (exc.partial).
+            exc.partial = self._timed_out_partial(exc, env)
+            raise
         finally:
             try:
                 os.unlink(cfg_path)
@@ -793,6 +1006,8 @@ class OpenCodeLLM(LLMCallBase):
                 returncode=run.returncode if run.returncode != 0 else -1,
                 stderr=run.stderr or "no session id in opencode output",
                 stream_result=run.stdout,
+                session_id=session_id,
+                error=run_error,
             )
 
         export = self._run_export(session_id, env)
@@ -831,6 +1046,27 @@ class OpenCodeLLM(LLMCallBase):
             # and usage must stay the pure token/cost totals.
             usage=dict(meta) if meta else None,
             session_id=session_id,
+            error=self._last_export_error,
+        )
+
+    def _timed_out_partial(self, exc: subprocess.TimeoutExpired, env: dict) -> Optional["OpenCodeQueryResult"]:
+        """What a timed-out ``run`` left: its session id (from the partial stream) and, through
+        ``opencode export``, the usage and transcript so far. ``None`` when no session was created."""
+        out = exc.output if isinstance(exc.output, str) else (
+            exc.output.decode("utf-8", "replace") if exc.output else "")
+        session_id = parse_session_id(out or "")
+        if session_id is None:
+            return None
+        try:
+            _text, meta, stream, err = self._extract_from_export(self._run_export(session_id, env))
+        except Exception:  # noqa: BLE001 -- best effort: the id alone is still worth recording
+            meta, stream, err = {}, "", None
+        stderr = exc.stderr if isinstance(exc.stderr, str) else (
+            exc.stderr.decode("utf-8", "replace") if exc.stderr else "")
+        return OpenCodeQueryResult(
+            result="", returncode=-1, stderr=stderr or "", stream_result=stream or out,
+            usage=dict(meta) if meta else None, session_id=session_id,
+            error=err or parse_run_error(out or ""),
         )
 
     def _capture(self, cmd: list, env: dict, stdin_text: Optional[str] = None) -> SimpleNamespace:
@@ -859,15 +1095,25 @@ class OpenCodeLLM(LLMCallBase):
                 fh.write(stdin_text)
         try:
             with open(out_path, "w") as out_fh, open(in_path or os.devnull, "r") as in_fh0:
-                proc = subprocess.run(
-                    cmd,
-                    stdin=in_fh0,
-                    stdout=out_fh,
-                    stderr=subprocess.PIPE,
-                    text=True,
-                    timeout=self.timeout_seconds,
-                    env=env,
-                )
+                try:
+                    proc = subprocess.run(
+                        cmd,
+                        stdin=in_fh0,
+                        stdout=out_fh,
+                        stderr=subprocess.PIPE,
+                        text=True,
+                        timeout=self.timeout_seconds,
+                        env=env,
+                    )
+                except subprocess.TimeoutExpired as exc:
+                    # the stream so far (it names the session) instead of nothing
+                    out_fh.flush()
+                    try:
+                        with open(out_path, "r") as part:
+                            exc.output = part.read()
+                    except OSError:
+                        pass
+                    raise
             with open(out_path, "r") as in_fh:
                 stdout = in_fh.read()
             return SimpleNamespace(

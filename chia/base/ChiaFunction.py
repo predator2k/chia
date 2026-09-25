@@ -380,7 +380,12 @@ def _try_proxy(func, opts, bypass_state, hooks, args, kwargs, display_name):
                    profiler.prepare_dispatch(opts, args, kwargs,
                                              display_name=display_name))
     full_opts = {"name": func.__qualname__, **opts}
-    return get_dispatch_proxy().submit.remote(
+    submit = get_dispatch_proxy().submit
+    if opts.get("max_retries") == 0:
+        # The proxy's own actor-task retries (for a proxy restart) would re-run a
+        # function declared never to be re-executed (e.g. a whole agent call).
+        submit = submit.options(max_task_retries=0)
+    return submit.remote(
         func, full_opts, bypass_state, hooks, profile, args, kwargs)
 
 

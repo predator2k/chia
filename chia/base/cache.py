@@ -322,12 +322,19 @@ def start_cache(
     Call from the driver after ``ray.init()``. Mirrors
     :func:`chia.trace.profiler.start_collector`.
 
-    The actor is created ``detached`` so it is reachable from workers in a
-    *different* Ray job (e.g. a bypass provider running on a remote worker) — a
-    plain named actor is only visible within its creating job. Pair it with an
-    explicit ``namespace`` so cross-job lookups resolve it. ``stop_cache`` still
-    tears it down; cross-run reuse remains the on-disk pickles + warm start, not
-    a lingering live actor.
+    With an explicit ``namespace`` the actor is created ``detached`` in that
+    fixed namespace, so it is reachable from workers in a *different* Ray job
+    (e.g. a bypass provider running on a remote worker), and a later driver in
+    the same namespace reuses it (``get_if_exists``) instead of adding another.
+
+    Without a ``namespace`` the actor lives in the driver's namespace — an
+    anonymous one unless ``ray.init(namespace=...)`` named it — where no other
+    job could find it anyway, so it is *not* detached there: it belongs to the
+    driver's job and Ray removes it when the driver exits (cleanly or not). A
+    detached actor in an anonymous namespace outlives its driver unreachable,
+    one per driver, each holding a worker process and a worker port of the head.
+    ``stop_cache`` still tears either kind down; cross-run reuse remains the
+    on-disk pickles + warm start, not a lingering live actor.
 
     Args:
         size: Numeric budget; multiplied by ``UNITS[units]`` to get bytes.
@@ -361,12 +368,13 @@ def start_cache(
         get_if_exists=True,
         num_cpus=0,
         scheduling_strategy=scheduling,
-        # Detached so a bypass provider on a worker in a different Ray job can
-        # still reach the cache by name (a plain named actor is job-scoped).
-        lifetime="detached",
     )
     if namespace:
         opts["namespace"] = namespace
+        # Detached so a bypass provider on a worker in a different Ray job can
+        # still reach the cache by name (a plain named actor is job-scoped); the
+        # fixed namespace bounds it to one actor, reused by every later driver.
+        opts["lifetime"] = "detached"
 
     handle = chia_actor(Cache.options(**opts).remote(cache_dir_path, budget, config))
     # Block until the actor is live and responding.
