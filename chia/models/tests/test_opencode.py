@@ -278,6 +278,34 @@ def test_build_config_permission_kwarg_can_restrict_to_mcp_only():
     assert set(cfg["permission"]) == set(perm) | {"external_directory", "read"}
 
 
+def test_build_config_declares_local_provider(monkeypatch):
+    """`local/<model>` needs no provider block from the caller: the gateway's provider is declared per call,
+    its URL, limits and run tag from the environment, a fresh session header per run, and opencode's
+    5-minute header/chunk timeouts raised for a shared local server."""
+    monkeypatch.setenv("CHIA_LOCAL_LLM_BASE_URL", "http://127.0.0.1:9999/v1")
+    monkeypatch.setenv("CHIA_LOCAL_LLM_CONTEXT", "131072")
+    monkeypatch.setenv("CHIA_LLM_TAG", "exp.fp.plain.r1")
+    llm = OpenCodeLLM(model="local/qwen3.6-35b-a3b")
+    a, b = llm._build_config([]), llm._build_config([])
+    p = a["provider"]["local"]
+    assert p["npm"] == "@ai-sdk/openai-compatible"
+    assert p["options"]["baseURL"] == "http://127.0.0.1:9999/v1"
+    assert p["options"]["includeUsage"] is True
+    assert p["options"]["headerTimeout"] > 300_000 and p["options"]["chunkTimeout"] > 300_000
+    assert p["options"]["headers"]["X-LLM-Tag"] == "exp.fp.plain.r1"
+    assert p["options"]["headers"]["X-LLM-Session"] != b["provider"]["local"]["options"]["headers"]["X-LLM-Session"]
+    m = p["models"]["qwen3.6-35b-a3b"]
+    assert m["limit"] == {"context": 131072, "output": 32768}
+    assert "high" in m["variants"]
+
+
+def test_build_config_local_provider_only_for_local_models():
+    assert "provider" not in OpenCodeLLM(model="openrouter/deepseek/deepseek-v4.1-flash")._build_config([])
+    own = oc_mod.AdditionalModelProvider(id="local", models=["m"], base_url="http://elsewhere/v1")
+    cfg = OpenCodeLLM(model="local/m", additional_providers=[own])._build_config([])
+    assert cfg["provider"]["local"]["options"]["baseURL"] == "http://elsewhere/v1"   # the caller's wins
+
+
 def test_build_run_cmd_flags():
     llm = OpenCodeLLM(model="anthropic/claude-sonnet-4-6", work_dir="/tmp/x")
     cmd = llm._build_run_cmd("hello world")

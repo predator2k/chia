@@ -19,6 +19,7 @@ import os
 import re
 import subprocess
 import tempfile
+import uuid
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
@@ -306,6 +307,57 @@ class AdditionalModelProvider:
         if options:
             entry["options"] = options
         return entry
+
+
+# ---------------------------------------------------------------------------
+# The local model gateway
+# ---------------------------------------------------------------------------
+
+LOCAL_PROVIDER_ID = "local"
+LOCAL_BASE_URL_DEFAULT = "http://127.0.0.1:18100/v1"
+LOCAL_CONTEXT_DEFAULT = 262144
+LOCAL_OUTPUT_DEFAULT = 32768
+# the effort names opencode's --variant takes for other providers; Qwen-style local models have no effort
+# control, so each is declared (an undeclared variant would not resolve) and adds nothing to the request
+LOCAL_VARIANTS = ("minimal", "low", "medium", "high", "xhigh", "max")
+
+
+def local_provider(model_id: str, session_id: Optional[str] = None,
+                   env: Optional[Dict[str, str]] = None) -> AdditionalModelProvider:
+    """The ``local`` provider: an OpenAI-compatible gateway in front of self-hosted model servers.
+
+    ``provider: local`` with ``model: <id>`` (opencode's ``local/<id>``) selects it with no provider block in
+    a run file: :class:`OpenCodeLLM` declares it in every call's config. What differs between hosts comes
+    from the environment, so a Ray worker configures it exactly as the driver does:
+
+    * ``CHIA_LOCAL_LLM_BASE_URL``: the gateway's OpenAI base URL (default ``http://127.0.0.1:18100/v1``, the
+      chialu-a3eval gateway on squire).
+    * ``CHIA_LOCAL_LLM_CONTEXT`` / ``CHIA_LOCAL_LLM_OUTPUT``: the context and per-step output limits opencode
+      plans with (defaults 262144 / 32768, the servers' limits). opencode compacts a session before the
+      context limit and asks for at most the output limit per step; limits above the server's would turn a
+      compaction into a refused request.
+    * ``CHIA_LLM_TAG``: sent as ``X-LLM-Tag``, so the gateway's request log attributes tokens to a run.
+
+    Each call carries its own ``X-LLM-Session`` header: the gateway keeps every step of the call on the backend
+    that holds its prefix cache. ``includeUsage`` makes the stream report token usage, which opencode needs
+    for compaction and CHIA for the call's usage. opencode's request timeouts are raised: a shared local
+    server decodes one stream far slower than a hosted API and the gateway may queue a step, while opencode
+    aborts by default after 5 min without response headers or between two chunks. The call's own
+    ``timeout_seconds`` still bounds the whole call.
+    """
+    env = os.environ if env is None else env
+    ctx = int(env.get("CHIA_LOCAL_LLM_CONTEXT") or LOCAL_CONTEXT_DEFAULT)
+    out = int(env.get("CHIA_LOCAL_LLM_OUTPUT") or LOCAL_OUTPUT_DEFAULT)
+    headers = {"X-LLM-Session": session_id or uuid.uuid4().hex}
+    if env.get("CHIA_LLM_TAG"):
+        headers["X-LLM-Tag"] = env["CHIA_LLM_TAG"]
+    model = {"name": model_id, "limit": {"context": ctx, "output": out}, "reasoning": True, "tool_call": True,
+             "temperature": True, "attachment": False, "variants": {v: {} for v in LOCAL_VARIANTS}}
+    return AdditionalModelProvider(
+        id=LOCAL_PROVIDER_ID, name="Local LLM gateway", models={model_id: model},
+        base_url=env.get("CHIA_LOCAL_LLM_BASE_URL") or LOCAL_BASE_URL_DEFAULT, api_key="local",
+        options={"headers": headers, "includeUsage": True, "timeout": False,
+                 "headerTimeout": 3_600_000, "chunkTimeout": 1_800_000})
 
 
 @dataclass
@@ -913,9 +965,14 @@ class OpenCodeLLM(LLMCallBase):
         # opencode's tool-output directory is shared by every session of the user (other runs' truncated
         # tool outputs land there), so no call may read it, whatever the caller's block says.
         cfg["permission"] = deny_tool_output(perm)
-        if self.additional_providers:
+        providers = list(self.additional_providers)
+        prefix = LOCAL_PROVIDER_ID + "/"
+        if (self.model or "").startswith(prefix) and not any(p.id == LOCAL_PROVIDER_ID for p in providers):
+            # a fresh session id per opencode run: one run is one agent session for the gateway's stickiness
+            providers.append(local_provider(self.model[len(prefix):]))
+        if providers:
             provider_cfg: dict = cfg.setdefault("provider", {})
-            for provider in self.additional_providers:
+            for provider in providers:
                 provider_cfg[provider.id] = provider.to_config_entry()
         return cfg
 
