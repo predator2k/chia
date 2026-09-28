@@ -295,7 +295,7 @@ def test_build_config_declares_local_provider(monkeypatch, local_env):
     that makes opencode ask for 81,920 tokens a step, and a header wait declared to the gateway."""
     monkeypatch.setenv("CHIA_LOCAL_LLM_BASE_URL", "http://127.0.0.1:9999/v1")
     monkeypatch.setenv("CHIA_LOCAL_LLM_CONTEXT", "131072")
-    llm = OpenCodeLLM(model="local/qwen3.6-35b-a3b", timeout_seconds=43200)
+    llm = OpenCodeLLM(model="local/qwen3.6-35b-a3b", timeout_seconds=1200)
     a = llm._build_config([])
     sa = llm._gateway_session
     b = llm._build_config([])
@@ -304,27 +304,27 @@ def test_build_config_declares_local_provider(monkeypatch, local_env):
     assert p["options"]["baseURL"] == "http://127.0.0.1:9999/v1"
     assert p["options"]["apiKey"] == "tok-0123456789abcdef"
     assert p["options"]["includeUsage"] is True
-    assert p["options"]["headerTimeout"] == 46800 * 1000 and p["options"]["chunkTimeout"] > 300_000
+    assert p["options"]["headerTimeout"] == 1260 * 1000 and p["options"]["chunkTimeout"] == 180 * 1000
     h = p["options"]["headers"]
-    assert h["X-LLM-Tag"] == "exp.fp.plain.r1" and h["X-LLM-Header-Timeout-S"] == "46800"
+    assert h["X-LLM-Tag"] == "exp.fp.plain.r1" and h["X-LLM-Header-Timeout-S"] == "1260"
     assert h["X-LLM-Session"] == sa != b["provider"]["local"]["options"]["headers"]["X-LLM-Session"]
     m = p["models"]["qwen3.6-35b-a3b"]
     assert m["limit"] == {"context": 131072, "output": 81920}
     assert "high" in m["variants"]
 
 
-def test_local_calls_need_a_tag_a_token_and_a_long_timeout(monkeypatch, local_env):
-    OpenCodeLLM(model="local/m", timeout_seconds=43200)
-    with pytest.raises(ValueError, match="too short"):
-        OpenCodeLLM(model="local/m", timeout_seconds=1200)
+def test_local_calls_need_a_tag_a_token_and_a_sane_timeout(monkeypatch, local_env):
+    OpenCodeLLM(model="local/m", timeout_seconds=1200)              # the API runs' call timeout is fine
+    with pytest.raises(ValueError, match="first-byte limit"):
+        OpenCodeLLM(model="local/m", timeout_seconds=300)
     monkeypatch.delenv("CHIA_LLM_TAG")
     with pytest.raises(ValueError, match="CHIA_LLM_TAG"):
-        OpenCodeLLM(model="local/m", timeout_seconds=43200)
+        OpenCodeLLM(model="local/m", timeout_seconds=1200)
     monkeypatch.setenv("CHIA_LLM_TAG", "x")
     monkeypatch.setenv("CHIA_LOCAL_LLM_TOKEN_FILE", "/nonexistent/token")
     with pytest.raises(ValueError, match="gateway token"):
-        OpenCodeLLM(model="local/m", timeout_seconds=43200)
-    assert oc_mod.check_local(28800, {"CHIA_LLM_TAG": "x", "CHIA_LOCAL_LLM_TOKEN": "t"}) == []
+        OpenCodeLLM(model="local/m", timeout_seconds=1200)
+    assert oc_mod.check_local(600, {"CHIA_LLM_TAG": "x", "CHIA_LOCAL_LLM_TOKEN": "t"}) == []
     # other providers are untouched by any of it
     OpenCodeLLM(model="deepseek/deepseek-flash", timeout_seconds=1200)
 
@@ -333,7 +333,7 @@ def test_local_settings_are_taken_where_the_node_is_built(monkeypatch, local_env
     """A call that runs on a Ray worker sees the raylet's environment, not the driver's: the node carries
     the driver's tag, token and URL from its construction."""
     monkeypatch.setenv("CHIA_LOCAL_LLM_BASE_URL", "http://127.0.0.1:9999/v1")
-    llm = OpenCodeLLM(model="local/m", timeout_seconds=43200)
+    llm = OpenCodeLLM(model="local/m", timeout_seconds=1200)
     for k in ("CHIA_LLM_TAG", "CHIA_LOCAL_LLM_TOKEN_FILE", "CHIA_LOCAL_LLM_BASE_URL"):
         monkeypatch.delenv(k)
     p = llm._build_config([])["provider"]["local"]["options"]
@@ -347,7 +347,7 @@ def test_local_call_records_its_gateway_session(monkeypatch, local_env):
     capture = {"calls": []}
     _install_fake_subprocess(monkeypatch, run_stdout=_step_start("ses_loc1"), export_obj=_export_obj(text="PONG"),
                              capture=capture)
-    llm = OpenCodeLLM(model="local/m", timeout_seconds=43200)
+    llm = OpenCodeLLM(model="local/m", timeout_seconds=1200)
     cli = llm.prompt("hi", tools=[])
     sent = capture["calls"][0]["config"]["provider"]["local"]["options"]["headers"]["X-LLM-Session"]
     assert cli.success and cli.gateway_session == sent

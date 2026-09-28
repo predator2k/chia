@@ -324,13 +324,16 @@ LOCAL_OUTPUT_DEFAULT = 81920
 # How long opencode waits for a step's response headers. The gateway holds them back until the first
 # token, so an error before it (a queue timeout, a context overflow) reaches opencode as an HTTP status,
 # which opencode acts on (it retries a 503 after its Retry-After, it compacts on a context overflow); it
-# declares this wait in X-LLM-Header-Timeout-S and sends the headers early only near its end. Longer than
-# any call may run, so the call's own timeout is what bounds a step.
-LOCAL_HEADER_TIMEOUT_S = 46800
-# A call through the gateway: one step may take up to the gateway's per-request cap (8 h: 81,920 tokens at
-# 3-6 tokens/s), so a call timeout under that can kill a step that is merely slow. 12 h is the evaluation's.
-LOCAL_MIN_TIMEOUT_S = 28800
-LOCAL_TIMEOUT_S = 43200
+# declares this wait in X-LLM-Header-Timeout-S and sends the headers early only near its end. The gateway
+# bounds that wait by its queue (600 s) and first-byte (600 s) limits, so this is their sum and a minute.
+LOCAL_HEADER_TIMEOUT_S = 1260
+# How long opencode waits between two chunks of a stream: the gateway ends a stream stalled for 120 s itself
+# (with an error event, on which opencode sends the step again), so this only has to outlast that.
+LOCAL_CHUNK_TIMEOUT_S = 180
+# A call's timeout below the gateway's first-byte limit (600 s) could end a healthy call before its first
+# step has produced a token: the one check on it. The call timeout itself is the caller's (run file, plain
+# loop).
+LOCAL_MIN_CALL_TIMEOUT_S = 600
 # the effort names opencode's --variant takes for other providers; Qwen-style local models have no effort
 # control, so each is declared (an undeclared variant would not resolve) and adds nothing to the request
 LOCAL_VARIANTS = ("minimal", "low", "medium", "high", "xhigh", "max")
@@ -361,7 +364,7 @@ def local_token(env: Dict[str, str]) -> Optional[str]:
 def check_local(timeout_s: Optional[float], env: Optional[Dict[str, str]] = None) -> List[str]:
     """What keeps a ``local`` call from being run as the evaluation needs it (empty when nothing does): a
     run tag, so the gateway's log attributes every token to a run; the gateway's token; and a call timeout
-    of at least :data:`LOCAL_MIN_TIMEOUT_S`. ADIR and the plain loop call this before a run starts, and
+    of at least :data:`LOCAL_MIN_CALL_TIMEOUT_S`. The plain loop calls this before a run starts, and
     :class:`OpenCodeLLM` when it is built, so a misconfigured run fails at once rather than call by call."""
     env = os.environ if env is None else env
     problems = []
@@ -371,10 +374,9 @@ def check_local(timeout_s: Optional[float], env: Optional[Dict[str, str]] = None
     if not local_token(env):
         problems.append("no gateway token: set CHIA_LOCAL_LLM_TOKEN_FILE to the gateway's token file "
                         "(chialu-a3eval: /data2/mhnie/chialu-home/llm/state/gateway.token) or CHIA_LOCAL_LLM_TOKEN")
-    if timeout_s is not None and float(timeout_s) < LOCAL_MIN_TIMEOUT_S:
-        problems.append("timeout %ss is too short for a local call: one step may take the gateway's 8 h "
-                        "per-request cap; use at least %d s (the evaluation uses %d s)" % (
-                            timeout_s, LOCAL_MIN_TIMEOUT_S, LOCAL_TIMEOUT_S))
+    if timeout_s is not None and float(timeout_s) < LOCAL_MIN_CALL_TIMEOUT_S:
+        problems.append("timeout %ss is shorter than the gateway's first-byte limit (%d s): a healthy local call "
+                        "could end before its first token" % (timeout_s, LOCAL_MIN_CALL_TIMEOUT_S))
     return problems
 
 
@@ -399,9 +401,9 @@ def local_provider(model_id: str, session_id: Optional[str] = None,
     attempts as ``gateway_session``): the gateway keeps every step of the call on the backend that holds its
     prefix cache, and its log rows name the call. ``includeUsage`` makes the stream report token usage, which
     opencode needs for compaction and CHIA for the call's usage. opencode's header wait is
-    :data:`LOCAL_HEADER_TIMEOUT_S`, declared to the gateway in ``X-LLM-Header-Timeout-S``; its chunk timeout is
-    30 min (the gateway ends a stream stalled for 10 min itself). The call's own ``timeout_seconds`` bounds
-    the whole call.
+    :data:`LOCAL_HEADER_TIMEOUT_S`, declared to the gateway in ``X-LLM-Header-Timeout-S``, and its chunk wait
+    :data:`LOCAL_CHUNK_TIMEOUT_S`; the gateway's own limits (a queue of 600 s, a first token within 600 s, a
+    stall of 120 s) detect a hung request first. The call's own ``timeout_seconds`` bounds the whole call.
     """
     env = os.environ if env is None else env
     ctx = int(env.get("CHIA_LOCAL_LLM_CONTEXT") or LOCAL_CONTEXT_DEFAULT)
@@ -416,7 +418,7 @@ def local_provider(model_id: str, session_id: Optional[str] = None,
         id=LOCAL_PROVIDER_ID, name="Local LLM gateway", models={model_id: model},
         base_url=env.get("CHIA_LOCAL_LLM_BASE_URL") or LOCAL_BASE_URL_DEFAULT, api_key=local_token(env) or "none",
         options={"headers": headers, "includeUsage": True, "timeout": False,
-                 "headerTimeout": LOCAL_HEADER_TIMEOUT_S * 1000, "chunkTimeout": 1_800_000})
+                 "headerTimeout": LOCAL_HEADER_TIMEOUT_S * 1000, "chunkTimeout": LOCAL_CHUNK_TIMEOUT_S * 1000})
 
 
 @dataclass
@@ -675,7 +677,7 @@ class OpenCodeLLM(LLMCallBase):
 
         # A `local/<model>` call goes to the local LLM gateway: its settings are taken here, where the node
         # is built (a call may run on a Ray worker with another environment), and a run that would not be
-        # accounted or would kill slow steps (no tag, no token, a short timeout) is refused now.
+        # accounted (no tag, no token) or whose timeout is under the gateway's first-byte limit is refused now.
         self._local_env: Dict[str, str] = {}
         self._gateway_session: Optional[str] = None
         if (self.model or "").startswith(LOCAL_PROVIDER_ID + "/") and not any(
