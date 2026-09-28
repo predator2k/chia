@@ -316,10 +316,66 @@ class AdditionalModelProvider:
 LOCAL_PROVIDER_ID = "local"
 LOCAL_BASE_URL_DEFAULT = "http://127.0.0.1:18100/v1"
 LOCAL_CONTEXT_DEFAULT = 262144
-LOCAL_OUTPUT_DEFAULT = 32768
+# A step's output cap, reasoning included. opencode asks for min(this model limit,
+# OPENCODE_EXPERIMENTAL_OUTPUT_TOKEN_MAX), and ADIR sets the second term far higher, so this is the cap a
+# step gets: 81,920 is Qwen's recommendation for hard reasoning (at 32,768 thinking ran out and a call
+# produced no program).
+LOCAL_OUTPUT_DEFAULT = 81920
+# How long opencode waits for a step's response headers. The gateway holds them back until the first
+# token, so an error before it (a queue timeout, a context overflow) reaches opencode as an HTTP status,
+# which opencode acts on (it retries a 503 after its Retry-After, it compacts on a context overflow); it
+# declares this wait in X-LLM-Header-Timeout-S and sends the headers early only near its end. Longer than
+# any call may run, so the call's own timeout is what bounds a step.
+LOCAL_HEADER_TIMEOUT_S = 46800
+# A call through the gateway: one step may take up to the gateway's per-request cap (8 h: 81,920 tokens at
+# 3-6 tokens/s), so a call timeout under that can kill a step that is merely slow. 12 h is the evaluation's.
+LOCAL_MIN_TIMEOUT_S = 28800
+LOCAL_TIMEOUT_S = 43200
 # the effort names opencode's --variant takes for other providers; Qwen-style local models have no effort
 # control, so each is declared (an undeclared variant would not resolve) and adds nothing to the request
 LOCAL_VARIANTS = ("minimal", "low", "medium", "high", "xhigh", "max")
+# the environment the local provider reads, captured where an OpenCodeLLM is built (the driver), so a call
+# that runs on a Ray worker, whose environment is the raylet's, is configured exactly as the driver asked
+LOCAL_ENV_PREFIXES = ("CHIA_LOCAL_LLM_", "CHIA_LLM_TAG")
+
+
+def local_env(env: Optional[Dict[str, str]] = None) -> Dict[str, str]:
+    env = os.environ if env is None else env
+    return {k: v for k, v in env.items() if k.startswith(LOCAL_ENV_PREFIXES) and v}
+
+
+def local_token(env: Dict[str, str]) -> Optional[str]:
+    """The gateway's token: ``CHIA_LOCAL_LLM_TOKEN``, else the content of ``CHIA_LOCAL_LLM_TOKEN_FILE``."""
+    if env.get("CHIA_LOCAL_LLM_TOKEN"):
+        return env["CHIA_LOCAL_LLM_TOKEN"].strip()
+    path = env.get("CHIA_LOCAL_LLM_TOKEN_FILE")
+    if not path:
+        return None
+    try:
+        with open(os.path.expanduser(path)) as f:
+            return f.read().strip() or None
+    except OSError:
+        return None
+
+
+def check_local(timeout_s: Optional[float], env: Optional[Dict[str, str]] = None) -> List[str]:
+    """What keeps a ``local`` call from being run as the evaluation needs it (empty when nothing does): a
+    run tag, so the gateway's log attributes every token to a run; the gateway's token; and a call timeout
+    of at least :data:`LOCAL_MIN_TIMEOUT_S`. ADIR and the plain loop call this before a run starts, and
+    :class:`OpenCodeLLM` when it is built, so a misconfigured run fails at once rather than call by call."""
+    env = os.environ if env is None else env
+    problems = []
+    if not env.get("CHIA_LLM_TAG"):
+        problems.append("CHIA_LLM_TAG is not set: every local call must name its run (the gateway's request "
+                        "log attributes tokens by it)")
+    if not local_token(env):
+        problems.append("no gateway token: set CHIA_LOCAL_LLM_TOKEN_FILE to the gateway's token file "
+                        "(chialu-a3eval: /data2/mhnie/chialu-home/llm/state/gateway.token) or CHIA_LOCAL_LLM_TOKEN")
+    if timeout_s is not None and float(timeout_s) < LOCAL_MIN_TIMEOUT_S:
+        problems.append("timeout %ss is too short for a local call: one step may take the gateway's 8 h "
+                        "per-request cap; use at least %d s (the evaluation uses %d s)" % (
+                            timeout_s, LOCAL_MIN_TIMEOUT_S, LOCAL_TIMEOUT_S))
+    return problems
 
 
 def local_provider(model_id: str, session_id: Optional[str] = None,
@@ -328,36 +384,39 @@ def local_provider(model_id: str, session_id: Optional[str] = None,
 
     ``provider: local`` with ``model: <id>`` (opencode's ``local/<id>``) selects it with no provider block in
     a run file: :class:`OpenCodeLLM` declares it in every call's config. What differs between hosts comes
-    from the environment, so a Ray worker configures it exactly as the driver does:
+    from the environment (captured where the OpenCodeLLM is built, see :data:`LOCAL_ENV_PREFIXES`):
 
     * ``CHIA_LOCAL_LLM_BASE_URL``: the gateway's OpenAI base URL (default ``http://127.0.0.1:18100/v1``, the
       chialu-a3eval gateway on squire).
+    * ``CHIA_LOCAL_LLM_TOKEN_FILE`` (or ``CHIA_LOCAL_LLM_TOKEN``): the gateway's token, sent as the provider's
+      API key (``Authorization: Bearer``); squire is shared, and the gateway refuses a request without it.
     * ``CHIA_LOCAL_LLM_CONTEXT`` / ``CHIA_LOCAL_LLM_OUTPUT``: the context and per-step output limits opencode
-      plans with (defaults 262144 / 32768, the servers' limits). opencode compacts a session before the
-      context limit and asks for at most the output limit per step; limits above the server's would turn a
-      compaction into a refused request.
+      plans with (defaults 262144 / 81920). opencode compacts a session before the context limit less the
+      output limit and asks for at most the output limit per step (see :data:`LOCAL_OUTPUT_DEFAULT`).
     * ``CHIA_LLM_TAG``: sent as ``X-LLM-Tag``, so the gateway's request log attributes tokens to a run.
 
-    Each call carries its own ``X-LLM-Session`` header: the gateway keeps every step of the call on the backend
-    that holds its prefix cache. ``includeUsage`` makes the stream report token usage, which opencode needs
-    for compaction and CHIA for the call's usage. opencode's request timeouts are raised: a shared local
-    server decodes one stream far slower than a hosted API and the gateway may queue a step, while opencode
-    aborts by default after 5 min without response headers or between two chunks. The call's own
-    ``timeout_seconds`` still bounds the whole call.
+    Each call carries its own ``X-LLM-Session`` header (``session_id``, recorded in the call's metadata and
+    attempts as ``gateway_session``): the gateway keeps every step of the call on the backend that holds its
+    prefix cache, and its log rows name the call. ``includeUsage`` makes the stream report token usage, which
+    opencode needs for compaction and CHIA for the call's usage. opencode's header wait is
+    :data:`LOCAL_HEADER_TIMEOUT_S`, declared to the gateway in ``X-LLM-Header-Timeout-S``; its chunk timeout is
+    30 min (the gateway ends a stream stalled for 10 min itself). The call's own ``timeout_seconds`` bounds
+    the whole call.
     """
     env = os.environ if env is None else env
     ctx = int(env.get("CHIA_LOCAL_LLM_CONTEXT") or LOCAL_CONTEXT_DEFAULT)
     out = int(env.get("CHIA_LOCAL_LLM_OUTPUT") or LOCAL_OUTPUT_DEFAULT)
-    headers = {"X-LLM-Session": session_id or uuid.uuid4().hex}
+    headers = {"X-LLM-Session": session_id or uuid.uuid4().hex,
+               "X-LLM-Header-Timeout-S": str(LOCAL_HEADER_TIMEOUT_S)}
     if env.get("CHIA_LLM_TAG"):
         headers["X-LLM-Tag"] = env["CHIA_LLM_TAG"]
     model = {"name": model_id, "limit": {"context": ctx, "output": out}, "reasoning": True, "tool_call": True,
              "temperature": True, "attachment": False, "variants": {v: {} for v in LOCAL_VARIANTS}}
     return AdditionalModelProvider(
         id=LOCAL_PROVIDER_ID, name="Local LLM gateway", models={model_id: model},
-        base_url=env.get("CHIA_LOCAL_LLM_BASE_URL") or LOCAL_BASE_URL_DEFAULT, api_key="local",
+        base_url=env.get("CHIA_LOCAL_LLM_BASE_URL") or LOCAL_BASE_URL_DEFAULT, api_key=local_token(env) or "none",
         options={"headers": headers, "includeUsage": True, "timeout": False,
-                 "headerTimeout": 3_600_000, "chunkTimeout": 1_800_000})
+                 "headerTimeout": LOCAL_HEADER_TIMEOUT_S * 1000, "chunkTimeout": 1_800_000})
 
 
 @dataclass
@@ -377,6 +436,9 @@ class OpenCodeQueryResult(QueryResult):
     attempts: Optional[list] = None
     # The structured error event ({name, data}) of a failed call's last attempt.
     error: Optional[dict] = None
+    # The X-LLM-Session the local gateway saw for this opencode run (``local`` models only): the key that
+    # joins the call to the gateway's request log.
+    gateway_session: Optional[str] = None
 
 
 _USAGE_KEYS = ("input_tokens", "output_tokens", "reasoning_tokens", "cache_read", "cache_write",
@@ -611,6 +673,18 @@ class OpenCodeLLM(LLMCallBase):
                 "configured default model."
             )
 
+        # A `local/<model>` call goes to the local LLM gateway: its settings are taken here, where the node
+        # is built (a call may run on a Ray worker with another environment), and a run that would not be
+        # accounted or would kill slow steps (no tag, no token, a short timeout) is refused now.
+        self._local_env: Dict[str, str] = {}
+        self._gateway_session: Optional[str] = None
+        if (self.model or "").startswith(LOCAL_PROVIDER_ID + "/") and not any(
+                p.id == LOCAL_PROVIDER_ID for p in self.additional_providers):
+            self._local_env = local_env()
+            problems = check_local(timeout_seconds, self._local_env)
+            if problems:
+                raise ValueError("OpenCodeLLM(%s): %s" % (self.model, "; ".join(problems)))
+
         self._log_dir = log_dir
         if log_dir is not None:
             os.makedirs(log_dir, exist_ok=True)
@@ -680,6 +754,8 @@ class OpenCodeLLM(LLMCallBase):
                 self._last_export_error = None
                 cli = self._run_opencode(user_message, tools)
                 self._last_metadata["model"] = self.model or "<opencode default>"
+                if self._gateway_session:
+                    self._last_metadata["gateway_session"] = self._gateway_session
                 self._last_metadata["tools"] = [
                     {"name": t.name, "hostname": getattr(t, "hostname", None),
                      "port": getattr(t, "port", None),
@@ -703,6 +779,8 @@ class OpenCodeLLM(LLMCallBase):
                 if cli is None:
                     cli = getattr(exc, "partial", None)   # a timed-out run's session, if it had one
                 attempts.append(self._attempt_record(len(attempts) + 1, cli, exc))
+                if self._gateway_session and "gateway_session" not in attempts[-1]:
+                    attempts[-1]["gateway_session"] = self._gateway_session   # the gateway saw it all the same
 
                 # -- Rate limit: wait it out without spending an attempt --
                 if isinstance(exc, RateLimitError):
@@ -781,6 +859,7 @@ class OpenCodeLLM(LLMCallBase):
             session_id=last.get("session_id"),
             attempts=_public_attempts(attempts),
             error=last.get("error_event"),
+            gateway_session=last.get("gateway_session"),
         )
 
     @staticmethod
@@ -789,6 +868,8 @@ class OpenCodeLLM(LLMCallBase):
         entries the caller sees except the last one's, which becomes a failed result's transcript)."""
         rec: dict = {"attempt": n, "session_id": getattr(cli, "session_id", None),
                      "usage": dict(getattr(cli, "usage", None) or {})}
+        if getattr(cli, "gateway_session", None):
+            rec["gateway_session"] = cli.gateway_session
         if cli is not None:
             rec["returncode"] = getattr(cli, "returncode", None)
             rec["stream"] = getattr(cli, "stream_result", "") or ""
@@ -967,9 +1048,13 @@ class OpenCodeLLM(LLMCallBase):
         cfg["permission"] = deny_tool_output(perm)
         providers = list(self.additional_providers)
         prefix = LOCAL_PROVIDER_ID + "/"
+        self._gateway_session = None
         if (self.model or "").startswith(prefix) and not any(p.id == LOCAL_PROVIDER_ID for p in providers):
-            # a fresh session id per opencode run: one run is one agent session for the gateway's stickiness
-            providers.append(local_provider(self.model[len(prefix):]))
+            # a fresh session id per opencode run: one run is one agent session for the gateway's stickiness,
+            # and the id joins this attempt to the gateway's request log
+            self._gateway_session = uuid.uuid4().hex
+            env = {**os.environ, **getattr(self, "_local_env", {})}
+            providers.append(local_provider(self.model[len(prefix):], self._gateway_session, env))
         if providers:
             provider_cfg: dict = cfg.setdefault("provider", {})
             for provider in providers:
@@ -1070,6 +1155,7 @@ class OpenCodeLLM(LLMCallBase):
                 stream_result=run.stdout,
                 session_id=session_id,
                 error=run_error,
+                gateway_session=self._gateway_session,
             )
 
         export = self._run_export(session_id, env)
@@ -1109,6 +1195,7 @@ class OpenCodeLLM(LLMCallBase):
             usage=dict(meta) if meta else None,
             session_id=session_id,
             error=self._last_export_error,
+            gateway_session=self._gateway_session,
         )
 
     def _timed_out_partial(self, exc: subprocess.TimeoutExpired, env: dict) -> Optional["OpenCodeQueryResult"]:
@@ -1128,7 +1215,7 @@ class OpenCodeLLM(LLMCallBase):
         return OpenCodeQueryResult(
             result="", returncode=-1, stderr=stderr or "", stream_result=stream or out,
             usage=dict(meta) if meta else None, session_id=session_id,
-            error=err or parse_run_error(out or ""),
+            error=err or parse_run_error(out or ""), gateway_session=self._gateway_session,
         )
 
     def _capture(self, cmd: list, env: dict, stdin_text: Optional[str] = None) -> SimpleNamespace:
