@@ -304,30 +304,52 @@ def test_build_config_declares_local_provider(monkeypatch, local_env):
     assert p["options"]["baseURL"] == "http://127.0.0.1:9999/v1"
     assert p["options"]["apiKey"] == "tok-0123456789abcdef"
     assert p["options"]["includeUsage"] is True
-    assert p["options"]["headerTimeout"] == 1260 * 1000 and p["options"]["chunkTimeout"] == 180 * 1000
+    assert p["options"]["headerTimeout"] == 720 * 1000 and p["options"]["chunkTimeout"] == 360 * 1000
     h = p["options"]["headers"]
-    assert h["X-LLM-Tag"] == "exp.fp.plain.r1" and h["X-LLM-Header-Timeout-S"] == "1260"
+    assert h["X-LLM-Tag"] == "exp.fp.plain.r1" and h["X-LLM-Header-Timeout-S"] == "720"
     assert h["X-LLM-Session"] == sa != b["provider"]["local"]["options"]["headers"]["X-LLM-Session"]
     m = p["models"]["qwen3.6-35b-a3b"]
     assert m["limit"] == {"context": 131072, "output": 81920}
     assert "high" in m["variants"]
 
 
-def test_local_calls_need_a_tag_a_token_and_a_sane_timeout(monkeypatch, local_env):
-    OpenCodeLLM(model="local/m", timeout_seconds=1200)              # the API runs' call timeout is fine
-    with pytest.raises(ValueError, match="first-byte limit"):
-        OpenCodeLLM(model="local/m", timeout_seconds=300)
+def test_local_calls_need_a_tag_and_a_token(monkeypatch, local_env):
+    OpenCodeLLM(model="local/m", timeout_seconds=300)
     monkeypatch.delenv("CHIA_LLM_TAG")
     with pytest.raises(ValueError, match="CHIA_LLM_TAG"):
-        OpenCodeLLM(model="local/m", timeout_seconds=1200)
+        OpenCodeLLM(model="local/m")
     monkeypatch.setenv("CHIA_LLM_TAG", "x")
     monkeypatch.setenv("CHIA_LOCAL_LLM_TOKEN_FILE", "/nonexistent/token")
     with pytest.raises(ValueError, match="gateway token"):
-        OpenCodeLLM(model="local/m", timeout_seconds=1200)
-    assert oc_mod.check_local(600, {"CHIA_LLM_TAG": "x", "CHIA_LOCAL_LLM_TOKEN": "t"}) == []
+        OpenCodeLLM(model="local/m")
+    assert oc_mod.check_local({"CHIA_LLM_TAG": "x", "CHIA_LOCAL_LLM_TOKEN": "t"}) == []
     # other providers are untouched by any of it
     OpenCodeLLM(model="deepseek/deepseek-flash", timeout_seconds=1200)
 
+
+def test_a_local_call_has_no_call_timeout(monkeypatch, local_env):
+    """A local call runs without a call-level timeout (the gateway ends a hung request), whatever the caller
+    passes (ADIR turns a run file's null into 1,200 s); CHIA_LOCAL_LLM_CALL_TIMEOUT_S can set one. None or 0
+    means no timeout for any provider; the export of the session stays bounded."""
+    seen = []
+    def fake_run(cmd, **kw):
+        seen.append((cmd[1], kw.get("timeout")))
+        out = kw.get("stdout")
+        payload = _step_start("ses_t1") if cmd[1] == "run" else json.dumps(_export_obj(text="PONG"))
+        out.write(payload)
+        return SimpleNamespace(returncode=0, stdout=None, stderr="")
+    monkeypatch.setattr(oc_mod.subprocess, "run", fake_run)
+    llm = OpenCodeLLM(model="local/m", timeout_seconds=1200)
+    assert llm.timeout_seconds is None and llm.prompt("hi", tools=[]).success
+    assert seen == [("run", None), ("export", OpenCodeLLM.EXPORT_TIMEOUT_S)]
+    monkeypatch.setenv("CHIA_LOCAL_LLM_CALL_TIMEOUT_S", "7200")
+    assert OpenCodeLLM(model="local/m").timeout_seconds == 7200
+    seen.clear()
+    assert OpenCodeLLM(model="deepseek/deepseek-flash", timeout_seconds=0).prompt("hi", tools=[]).success
+    assert seen == [("run", None), ("export", OpenCodeLLM.EXPORT_TIMEOUT_S)]
+    seen.clear()
+    assert OpenCodeLLM(model="deepseek/deepseek-flash", timeout_seconds=900).prompt("hi", tools=[]).success
+    assert seen == [("run", 900), ("export", 900)]
 
 def test_local_settings_are_taken_where_the_node_is_built(monkeypatch, local_env):
     """A call that runs on a Ray worker sees the raylet's environment, not the driver's: the node carries
